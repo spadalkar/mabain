@@ -45,6 +45,8 @@ const char* MBError::error_str[] = {
     "buffer discarded", // buffer will be reclaimed by shrink
     "failed to create thread",
     "rc skipped",
+    "version mismatch",
+    "jemalloc error",
 
     ///////////////////////////////////
     "DB not exist",
@@ -52,9 +54,9 @@ const char* MBError::error_str[] = {
 
 const char* MBError::get_error_str(int err)
 {
-    if(err < 0)
+    if (err < 0)
         return "db error";
-    else if(err > MAX_ERROR_CODE)
+    else if (err > MAX_ERROR_CODE)
         return "invalid error code";
 
     return error_str[err];

@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2017 Cisco Inc.
+ * Copyright (C) 2025 Cisco Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU General Public License, version 2,
@@ -18,131 +18,253 @@
 
 #ifndef __DRM_BASE_H__
 #define __DRM_BASE_H__
+#ifdef __DEBUG__
+#include <unordered_map>
+#endif
 
-#include "rollable_file.h"
 #include "free_list.h"
+#include "rollable_file.h"
 
-#define DATA_BUFFER_ALIGNMENT      1
-#define DATA_SIZE_BYTE             2
-#define DATA_HDR_BYTE              4
-#define OFFSET_SIZE                6
-#define EDGE_SIZE                  13
-#define EDGE_LEN_POS               5
-#define EDGE_FLAG_POS              6
-#define EDGE_FLAG_DATA_OFF         0x01
-#define FLAG_NODE_MATCH            0x01
-#define FLAG_NODE_NONE             0x0
-#define BUFFER_ALIGNMENT           1
-#define LOCAL_EDGE_LEN             6
-#define LOCAL_EDGE_LEN_M1          5
-#define EDGE_NODE_LEADING_POS      7
-#define EXCEP_STATUS_NONE          0
-#define EXCEP_STATUS_ADD_EDGE      1
-#define EXCEP_STATUS_ADD_DATA_OFF  2
-#define EXCEP_STATUS_ADD_NODE      3
-#define EXCEP_STATUS_REMOVE_EDGE   4
-#define EXCEP_STATUS_CLEAR_EDGE    5
-#define EXCEP_STATUS_RC_NODE       6
-#define EXCEP_STATUS_RC_EDGE_STR   7
-#define EXCEP_STATUS_RC_DATA       8
-#define EXCEP_STATUS_RC_TREE       9
-#define MB_EXCEPTION_BUFF_SIZE     16
+#define DATA_BUFFER_ALIGNMENT 1
+#define DATA_SIZE_BYTE 2
+#define DATA_HDR_BYTE 4
+#define OFFSET_SIZE 6
+#define EDGE_SIZE 13
+#define EDGE_LEN_POS 5
+#define EDGE_FLAG_POS 6
+#define EDGE_FLAG_DATA_OFF 0x01
+#define FLAG_NODE_MATCH 0x01
+#define FLAG_NODE_SORTED 0x02
+#define FLAG_NODE_NONE 0x0
+#define BUFFER_ALIGNMENT 1
+#define LOCAL_EDGE_LEN 6
+#define LOCAL_EDGE_LEN_M1 5
+#define EDGE_NODE_LEADING_POS 7
+#define EXCEP_STATUS_NONE 0
+#define EXCEP_STATUS_ADD_EDGE 1
+#define EXCEP_STATUS_ADD_DATA_OFF 2
+#define EXCEP_STATUS_ADD_NODE 3
+#define EXCEP_STATUS_REMOVE_EDGE 4
+#define EXCEP_STATUS_CLEAR_EDGE 5
+#define EXCEP_STATUS_RC_NODE 6
+#define EXCEP_STATUS_RC_EDGE_STR 7
+#define EXCEP_STATUS_RC_DATA 8
+#define EXCEP_STATUS_RC_TREE 9
+#define MB_EXCEPTION_BUFF_SIZE 16
+
+#define MAX_BUFFER_RESERVE_SIZE 8192
+#define NUM_BUFFER_RESERVE MAX_BUFFER_RESERVE_SIZE / BUFFER_ALIGNMENT
+#define MAX_DATA_BUFFER_RESERVE_SIZE 0xFFFF
+#define NUM_DATA_BUFFER_RESERVE MAX_DATA_BUFFER_RESERVE_SIZE / DATA_BUFFER_ALIGNMENT
+
+#define JEMALLOC_ALIGNMENT 8
 
 namespace mabain {
 
+//
+// File/Layout Overview
+// ---------------------
+// Mabain stores its persistent state across three logical files per DB path:
+//
+// - <mbdir>_mabain_h  (header file; single page)
+//   - Contains the IndexHeader structure below. This holds global metadata,
+//     fixed configuration (block sizes, options), and runtime counters.
+//
+// - <mbdir>_mabain_i<N>  (index files; block 0..max)
+//   - Offset 0 of block 0 stores the root node (fixed at 0).
+//   - Nodes and edge data are addressed with 6‑byte offsets relative to the
+//     beginning of block 0. RC (resource collection/shrink) can relocate nodes,
+//     but the root node remains at offset 0.
+//
+// - <mbdir>_mabain_d<N>  (data/value files; block 0..max)
+//   - Block 0, beginning of file, has a small fixed header region of
+//     DATA_HEADER_SIZE bytes reserved for future use.
+//   - Embedded Prefix Cache Region (optional, fixed at initialization):
+//       [ pfxcache_offset, pfxcache_offset + pfxcache_size )
+//     The prefix cache is a contiguous area in block 0 of _mabain_d reserved
+//     and described by the fields below. Its internal layout is:
+//         PCShmHeader | tag2 | tab2 | tag3 | tab3 | valid4 | tag4 | tab4
+//     Capacities (pfx_cap2/3/4) are fixed after DB creation. When present,
+//     writers seed the cache during Add; readers never write here. In jemalloc
+//     mode, the value allocator (arena) starts AFTER m_data_offset so it never
+//     overlaps with the cache region.
+//   - User data region:
+//       [ m_data_offset, ... )
+//     All value buffers live here (either via jemalloc arena or free‑list).
+//
+// RC/Truncation Rules
+// - RC may move data within the files but must not move or truncate block 0
+//   below GetStartDataOffset() (i.e., below m_data_offset for new DBs with an
+//   embedded cache). Code paths avoid removing block 0 in RemoveUnused.
+// - The embedded cache is ephemeral; contents may be cleared on start. Only the
+//   reserved space and capacities are persistent and fixed.
+//
+// Backward Compatibility
+// - If pfxcache_size == 0, no embedded cache is present. Legacy deployments may
+//   use a standalone shared cache file (<mbdir>_pfxcache). New DBs initialize
+//   the embedded layout and avoid creating the legacy cache file.
+//
 // Mabain DB header
-typedef struct _IndexHeader
-{
+typedef struct _IndexHeader {
     uint16_t version[4];
-    int      data_size;
-    int64_t  count;
-    size_t   m_data_offset;
-    size_t   m_index_offset;
-    int64_t  pending_data_buff_size;
-    int64_t  pending_index_buff_size;
-    int64_t  n_states;
-    int64_t  n_edges;
-    int64_t  edge_str_size;
-    int      num_writer;
-    int      num_reader;
-    std::atomic<size_t> shm_index_sliding_start;
-    std::atomic<size_t> shm_data_sliding_start;
+    int data_size;
+    int64_t count;
+    size_t m_data_offset;
+    size_t m_index_offset;
+    int64_t pending_data_buff_size;
+    int64_t pending_index_buff_size;
+    int64_t n_states;
+    int64_t n_edges;
+    int64_t edge_str_size;
+    int num_writer;
+    int num_reader;
+    int64_t shm_queue_id;
+    int writer_options;
+    int dummy;
 
     // Lock-free data structure
     LockFreeShmData lock_free;
 
     // read/write lock
-    pthread_rwlock_t mb_rw_lock;
+    char padding[56]; // pthread_rwlock_t mb_rw_lock;
 
     // block size
     uint32_t index_block_size;
     uint32_t data_block_size;
     // number of entry per bucket for eviction
-    int64_t  entry_per_bucket;
+    int64_t entry_per_bucket;
     // number of DB insertions and updates
     // used for assigning bucket
-    int64_t  num_update;
+    int64_t num_update;
     uint16_t eviction_bucket_index;
 
     // temp variables used for abnormal writer terminations
-    int     excep_updating_status;
+    int excep_updating_status;
     uint8_t excep_buff[MB_EXCEPTION_BUFF_SIZE];
-    size_t  excep_offset;
-    size_t  excep_lf_offset;
+    size_t excep_offset;
+    size_t excep_lf_offset;
 
     // index root offset for insertions during rc
-    size_t               rc_m_index_off_pre;
-    size_t               rc_m_data_off_pre;
-    std::atomic<size_t>  rc_root_offset;
-    int64_t              rc_count;
+    size_t rc_m_index_off_pre;
+    size_t rc_m_data_off_pre;
+    std::atomic<size_t> rc_root_offset;
+    int64_t rc_count;
+
+    // multi-process async queue
+    int async_queue_size;
+    std::atomic<uint32_t> queue_index;
+    uint32_t writer_index;
+    std::atomic<uint32_t> rc_flag;
+
+    // Embedded prefix cache (fixed capacity, set at DB initialization)
+    // If pfxcache_size == 0, legacy external cache file is used.
+    size_t pfxcache_offset; // offset within _mabain_d where cache starts
+    size_t pfxcache_size;   // total bytes reserved for cache region
+    uint32_t pfx_cap2;      // number of slots in 2-byte table
+    uint32_t pfx_cap3;      // number of slots in 3-byte table
+    uint32_t pfx_cap4;      // number of slots in 4-byte table
 } IndexHeader;
 
 // An abstract interface class for Dict and DictMem
-class DRMBase
-{
+class DRMBase {
 public:
-    DRMBase()
+    DRMBase(const std::string& mbdir, int opts, bool index)
+        : options(opts)
     {
-        // Derived classes will initialize these objects.
-        kv_file = NULL;
-        free_lists = NULL;
+        // derived class will initialize header and kv_file
+        header = nullptr;
+        kv_file = nullptr;
+        free_lists = nullptr;
+        if (opts & CONSTS::ACCESS_MODE_WRITER) {
+            if (!(opts & CONSTS::OPTION_JEMALLOC)) {
+                if (index) {
+                    free_lists = new FreeList(mbdir + "_ibfl", BUFFER_ALIGNMENT, NUM_BUFFER_RESERVE);
+                } else {
+                    free_lists = new FreeList(mbdir + "_dbfl", BUFFER_ALIGNMENT, NUM_BUFFER_RESERVE);
+                }
+            }
+        }
     }
 
     ~DRMBase()
     {
     }
 
-    inline virtual void WriteData(const uint8_t *buff, unsigned len, size_t offset) const = 0;
-    inline int Reserve(size_t &offset, int size, uint8_t* &ptr);
+    inline virtual void WriteData(const uint8_t* buff, unsigned len, size_t offset) const = 0;
+    inline int Reserve(size_t& offset, int size, uint8_t*& ptr);
     inline uint8_t* GetShmPtr(size_t offset, int size) const;
     inline size_t CheckAlignment(size_t offset, int size) const;
-    inline int ReadData(uint8_t *buff, unsigned len, size_t offset) const;
+    inline int ReadData(uint8_t* buff, unsigned len, size_t offset) const;
     inline size_t GetResourceCollectionOffset() const;
     inline void RemoveUnused(size_t max_size, bool writer_mode = false);
 
-    FreeList *GetFreeList() const
+    FreeList* GetFreeList() const
     {
         return free_lists;
     }
 
-    IndexHeader *GetHeaderPtr() const
+    IndexHeader* GetHeaderPtr() const
     {
         return header;
     }
 
+    void PrintHeader(std::ostream& out_stream) const;
+
+    static void ValidateHeaderFile(const std::string& header_path, int mode, int queue_size,
+        bool& update_header);
+
 protected:
-    IndexHeader *header;
-    RollableFile *kv_file;
-    FreeList *free_lists;
+    static void ReadHeaderVersion(const std::string& header_path, uint16_t ver[4]);
+    static void ReadHeader(const std::string& header_path, uint8_t* buff, int buf_size);
+    static void WriteHeader(const std::string& header_path, uint8_t* buff);
+
+    int options;
+    IndexHeader* header;
+    RollableFile* kv_file;
+    // free_lists is the old way of managing memory. It will be replaced by jemalloc.
+    FreeList* free_lists;
+
+#ifdef __DEBUG__
+#define __BUFFER_TRACKER_IN_USE 1
+#define __BUFFER_TRACKER_RELEASED 2
+#define __BUFFER_TRACKER_INVALID 3
+    void add_tracking_buffer(size_t offset, int size = 0)
+    {
+        if (buffer_map.find(offset) == buffer_map.end()) {
+            buffer_map[offset] = __BUFFER_TRACKER_IN_USE;
+        } else {
+            buffer_map[offset] = __BUFFER_TRACKER_INVALID;
+        }
+    }
+    void remove_tracking_buffer(size_t offset, int size = 0)
+    {
+        if (buffer_map.find(offset) == buffer_map.end()) {
+            buffer_map[offset] = __BUFFER_TRACKER_INVALID;
+        } else {
+            if (buffer_map[offset] != __BUFFER_TRACKER_IN_USE) {
+                buffer_map[offset] = __BUFFER_TRACKER_INVALID;
+            } else {
+                buffer_map.erase(offset); // remove from tracking
+            }
+        }
+        buffer_map.erase(offset);
+    }
+    // buffer tracker
+    std::unordered_map<size_t, int> buffer_map;
+#endif
 };
 
-inline void DRMBase::WriteData(const uint8_t *buff, unsigned len, size_t offset) const
+inline void DRMBase::WriteData(const uint8_t* buff, unsigned len, size_t offset) const
 {
-    if(kv_file->RandomWrite(buff, len, offset) != len)
-        throw (int) MBError::WRITE_ERROR;
+    if (options & CONSTS::OPTION_JEMALLOC) {
+        kv_file->MemWrite(buff, len, offset);
+    } else {
+        if (kv_file->RandomWrite(buff, len, offset) != len)
+            throw (int)MBError::WRITE_ERROR;
+    }
 }
 
-inline int DRMBase::Reserve(size_t &offset, int size, uint8_t* &ptr)
+inline int DRMBase::Reserve(size_t& offset, int size, uint8_t*& ptr)
 {
     return kv_file->Reserve(offset, size, ptr);
 }
@@ -157,8 +279,12 @@ inline size_t DRMBase::CheckAlignment(size_t offset, int size) const
     return kv_file->CheckAlignment(offset, size);
 }
 
-inline int DRMBase::ReadData(uint8_t *buff, unsigned len, size_t offset) const
+// API for both jemalloc and non-jemalloc
+inline int DRMBase::ReadData(uint8_t* buff, unsigned len, size_t offset) const
 {
+    if (options & CONSTS::OPTION_JEMALLOC) {
+        return kv_file->MemRead(buff, len, offset);
+    }
     return kv_file->RandomRead(buff, len, offset);
 }
 
@@ -169,7 +295,7 @@ inline size_t DRMBase::GetResourceCollectionOffset() const
 
 inline void DRMBase::RemoveUnused(size_t max_size, bool writer_mode)
 {
-    return kv_file->RemoveUnused(max_size, writer_mode); 
+    return kv_file->RemoveUnused(max_size, writer_mode);
 }
 
 }

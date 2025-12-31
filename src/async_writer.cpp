@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2017 Cisco Inc.
+ * Copyright (C) 2018 Cisco Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU General Public License, version 2,
@@ -16,524 +16,337 @@
 
 // @author Changxue Deng <chadeng@cisco.com>
 
-#include <unistd.h>
 #include <string.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include "async_writer.h"
+#include "dict.h"
 #include "error.h"
+#include "integer_4b_5b.h"
 #include "logger.h"
 #include "mb_data.h"
 #include "mb_rc.h"
-#include "integer_4b_5b.h"
 
 namespace mabain {
 
-const int AsyncWriter::max_num_queue_node = 2048;
+AsyncWriter* AsyncWriter::writer_instance = NULL;
 
-static void free_async_node(AsyncNode *node_ptr)
+AsyncWriter* AsyncWriter::CreateInstance(DB* db_ptr)
 {
-    if(node_ptr->key != NULL)
-    {
-        free(node_ptr->key);
-        node_ptr->key = NULL;
-        node_ptr->key_len = 0;
-    }
-
-    if(node_ptr->data != NULL)
-    {
-        free(node_ptr->data);
-        node_ptr->data = NULL;
-        node_ptr->data_len = 0;
-    }
-
-    node_ptr->type = MABAIN_ASYNC_TYPE_NONE;
+    writer_instance = new AsyncWriter(db_ptr);
+    return writer_instance;
 }
 
-AsyncWriter::AsyncWriter(DB *db_ptr)
-                       : db(db_ptr),
-                         num_users(0),
-                         queue(NULL),
-                         tid(0),
-                         stop_processing(false),
-                         queue_index(0),
-                         writer_index(0)
+AsyncWriter* AsyncWriter::GetInstance()
+{
+    return writer_instance;
+}
+
+AsyncWriter::AsyncWriter(DB* db_ptr)
+    : db(db_ptr)
+    , tid(0)
+    , stop_processing(false)
+    , queue(NULL)
+    , header(NULL)
 {
     dict = NULL;
-    if(!(db_ptr->GetDBOptions() & CONSTS::ACCESS_MODE_WRITER))
-        throw (int) MBError::NOT_ALLOWED;
-    if(db == NULL)
-        throw (int) MBError::INVALID_ARG;
+    if (!(db_ptr->GetDBOptions() & CONSTS::ACCESS_MODE_WRITER))
+        throw (int)MBError::NOT_ALLOWED;
+    if (db == NULL)
+        throw (int)MBError::INVALID_ARG;
     dict = db->GetDictPtr();
-    if(dict == NULL)
-        throw (int) MBError::NOT_INITIALIZED;
+    if (dict == NULL)
+        throw (int)MBError::NOT_INITIALIZED;
 
-    queue = new AsyncNode[max_num_queue_node];
-    memset(queue, 0, max_num_queue_node * sizeof(AsyncNode));
-    for(int i = 0; i < max_num_queue_node; i++)
-    {
-        queue[i].in_use.store(false, std::memory_order_release);
-        if(pthread_mutex_init(&queue[i].mutex, NULL) != 0)
-        {
-            Logger::Log(LOG_LEVEL_ERROR, "failed to init mutex");
-            throw (int) MBError::MUTEX_ERROR;
-        }
-        if(pthread_cond_init(&queue[i].cond, NULL) != 0)
-        {
-            Logger::Log(LOG_LEVEL_ERROR, "failed to init conditional variable");
-            throw (int) MBError::MUTEX_ERROR;
-        }
-    }
+    // initialize shared memory queue pointer
+    header = dict->GetHeaderPtr();
+    if (header == NULL)
+        throw (int)MBError::NOT_INITIALIZED;
+    queue = dict->GetAsyncQueuePtr();
+    header->rc_flag.store(0, std::memory_order_release);
 
-    is_rc_running = false;
     rc_backup_dir = NULL;
     // start the thread
-    if(pthread_create(&tid, NULL, async_thread_wrapper, this) != 0)
-    {
+    if (pthread_create(&tid, NULL, async_thread_wrapper, this) != 0) {
         Logger::Log(LOG_LEVEL_ERROR, "failed to create async thread");
         tid = 0;
-        throw (int) MBError::THREAD_FAILED;
+        throw (int)MBError::THREAD_FAILED;
     }
-
 }
 
 AsyncWriter::~AsyncWriter()
 {
 }
 
-void AsyncWriter::UpdateNumUsers(int delta)
-{
-    if(delta > 0)
-        num_users.fetch_add(1, std::memory_order_release);
-    else if(delta < 0)
-        num_users.fetch_sub(1, std::memory_order_release);
-}
-
 int AsyncWriter::StopAsyncThread()
 {
-    if(num_users.load(std::memory_order_consume) > 0)
-    {
-        Logger::Log(LOG_LEVEL_ERROR, "still being used, cannot shutdown async thread");
-    }
-
     stop_processing = true;
+    dict->SHMQ_Signal();
 
-    for(int i = 0; i < max_num_queue_node; i++)
-    {
-        pthread_cond_signal(&queue[i].cond);
-    }
-
-    if(tid != 0)
-    {
-        Logger::Log(LOG_LEVEL_INFO, "joining async writer thread");
+    if (tid != 0) {
+        Logger::Log(LOG_LEVEL_DEBUG, "joining async writer thread");
         pthread_join(tid, NULL);
     }
 
-    for(int i = 0; i < max_num_queue_node; i++)
-    {
-        pthread_mutex_destroy(&queue[i].mutex);
-        pthread_cond_destroy(&queue[i].cond);
-    }
-
-    if(queue != NULL)
-        delete [] queue;
-
     return MBError::SUCCESS;
-}
-
-// Check if async tasks are completed.
-bool AsyncWriter::Busy() const
-{
-    uint32_t index = queue_index.load(std::memory_order_consume);
-    return index != writer_index || is_rc_running;
-}
-
-AsyncNode* AsyncWriter::AcquireSlot()
-{
-    uint32_t index = queue_index.fetch_add(1, std::memory_order_release);
-    AsyncNode *node_ptr = queue + (index % max_num_queue_node);
-
-    if(pthread_mutex_lock(&node_ptr->mutex) != 0)
-    {
-        Logger::Log(LOG_LEVEL_ERROR, "failed to lock mutex");
-        return NULL;
-    }
-
-    while(node_ptr->in_use.load(std::memory_order_consume))
-    {
-        pthread_cond_wait(&node_ptr->cond, &node_ptr->mutex);
-    }
-
-    return node_ptr;
-}
-
-int AsyncWriter::PrepareSlot(AsyncNode *node_ptr) const
-{
-    node_ptr->in_use.store(true, std::memory_order_release);
-    pthread_cond_signal(&node_ptr->cond);
-    if(pthread_mutex_unlock(&node_ptr->mutex) != 0)
-        return MBError::MUTEX_ERROR;
-    return MBError::SUCCESS;
-}
-
-int AsyncWriter::Add(const char *key, int key_len, const char *data,
-                     int data_len, bool overwrite)
-{
-    if(stop_processing)
-        return MBError::DB_CLOSED;
-
-    AsyncNode *node_ptr = AcquireSlot();
-    if(node_ptr == NULL)
-        return MBError::MUTEX_ERROR;
-
-    node_ptr->key = (char *) malloc(key_len);
-    node_ptr->data = (char *) malloc(data_len);
-    if(node_ptr->key == NULL || node_ptr->data == NULL)
-    {
-        pthread_mutex_unlock(&node_ptr->mutex);
-        free_async_node(node_ptr);
-        return MBError::NO_MEMORY;
-    }
-    memcpy(node_ptr->key, key, key_len);
-    memcpy(node_ptr->data, data, data_len);
-    node_ptr->key_len = key_len;
-    node_ptr->data_len = data_len;
-    node_ptr->overwrite = overwrite;
-
-    node_ptr->type = MABAIN_ASYNC_TYPE_ADD;
-
-
-    return PrepareSlot(node_ptr);
-}
-
-int AsyncWriter::Remove(const char *key, int len)
-{
-    if(stop_processing)
-        return MBError::DB_CLOSED;
-
-    AsyncNode *node_ptr = AcquireSlot();
-    if(node_ptr == NULL)
-        return MBError::MUTEX_ERROR;
-
-    node_ptr->key = (char *) malloc(len);
-    if(node_ptr->key == NULL)
-    {
-        pthread_mutex_unlock(&node_ptr->mutex);
-        free_async_node(node_ptr);
-        return MBError::NO_MEMORY;
-    }
-    memcpy(node_ptr->key, key, len);
-    node_ptr->key_len = len;
-    node_ptr->type = MABAIN_ASYNC_TYPE_REMOVE;
-
-    return PrepareSlot(node_ptr);
-}
-
-int AsyncWriter::Backup(const char *backup_dir)
-{
-    if(backup_dir == NULL)
-        return MBError::INVALID_ARG;
-
-    if(stop_processing)
-        return MBError::DB_CLOSED;
-
-    AsyncNode *node_ptr = AcquireSlot();
-    if(node_ptr == NULL)
-        return MBError::MUTEX_ERROR;
-
-    node_ptr->data = (char *) strdup(backup_dir);
-    if(node_ptr->data == NULL)
-    {
-        pthread_mutex_unlock(&node_ptr->mutex);
-        free_async_node(node_ptr);
-        return MBError::NO_MEMORY;
-    }
-    node_ptr->type = MABAIN_ASYNC_TYPE_BACKUP;
-    return PrepareSlot(node_ptr);
-}
-
-int AsyncWriter::RemoveAll()
-{
-    if(stop_processing)
-        return MBError::DB_CLOSED;
-
-    AsyncNode *node_ptr = AcquireSlot();
-    if(node_ptr == NULL)
-        return MBError::MUTEX_ERROR;
-
-    node_ptr->type = MABAIN_ASYNC_TYPE_REMOVE_ALL;
-
-    return PrepareSlot(node_ptr);
-}
-
-int  AsyncWriter::CollectResource(int64_t m_index_rc_size, int64_t m_data_rc_size,
-                                  int64_t max_dbsz, int64_t max_dbcnt)
-{
-    if(stop_processing)
-        return MBError::DB_CLOSED;
-
-    AsyncNode *node_ptr = AcquireSlot();
-    if(node_ptr == NULL)
-        return MBError::MUTEX_ERROR;
-
-    int64_t *data_ptr = (int64_t *) calloc(4, sizeof(int64_t));
-    if (data_ptr == NULL)
-        return MBError::NO_MEMORY;
-
-    node_ptr->data = data_ptr;
-    node_ptr->data_len = sizeof(int64_t)*4;
-    data_ptr[0] = m_index_rc_size;
-    data_ptr[1] = m_data_rc_size;
-    data_ptr[2] = max_dbsz;
-    data_ptr[3] = max_dbcnt;
-    node_ptr->type = MABAIN_ASYNC_TYPE_RC;
-
-    return PrepareSlot(node_ptr);
 }
 
 // Run a given number of tasks if they are available.
 // This function should only be called by rc or pruner.
 int AsyncWriter::ProcessTask(int ntasks, bool rc_mode)
 {
-    AsyncNode *node_ptr;
+    AsyncNode* node_ptr;
     MBData mbd;
     int rval = MBError::SUCCESS;
     int count = 0;
 
-    while(count < ntasks)
-    {
-        node_ptr = &queue[writer_index % max_num_queue_node];
-        if(pthread_mutex_lock(&node_ptr->mutex) != 0)
-        {
-            Logger::Log(LOG_LEVEL_ERROR, "failed to lock mutex");
-            throw (int) MBError::MUTEX_ERROR;
-        }
+    while (count < ntasks) {
+        node_ptr = &queue[header->writer_index % header->async_queue_size];
 
-        if(node_ptr->in_use.load(std::memory_order_consume))
-        {
-            switch(node_ptr->type)
-            {
-                case MABAIN_ASYNC_TYPE_ADD:
-                    if(rc_mode)
-                        mbd.options = CONSTS::OPTION_RC_MODE;
-                    mbd.buff = (uint8_t *) node_ptr->data;
-                    mbd.data_len = node_ptr->data_len;
+        if (node_ptr->in_use.load(std::memory_order_consume)) {
+            switch (node_ptr->type) {
+            case MABAIN_ASYNC_TYPE_ADD:
+                if (rc_mode)
+                    mbd.options = CONSTS::OPTION_RC_MODE;
+                mbd.buff = (uint8_t*)node_ptr->data;
+                mbd.data_len = node_ptr->data_len;
+                try {
+                    rval = dict->Add((uint8_t*)node_ptr->key, node_ptr->key_len, mbd, node_ptr->overwrite);
+                } catch (int err) {
+                    rval = err;
+                    Logger::Log(LOG_LEVEL_ERROR, "dict->Add throws error %s",
+                        MBError::get_error_str(err));
+                }
+                break;
+            case MABAIN_ASYNC_TYPE_REMOVE:
+                // FIXME
+                // Removing entries during rc is currently not supported.
+                // The index or data index could have been reset in fucntion ResourceColletion::Finish.
+                // However, the deletion may be run for some entry which still exist in the rc root tree.
+                // This requires modifying buffer in high end, where the offset for writing is greather than
+                // header->m_index_offset. This causes exception thrown from DictMem::WriteData.
+                // Note this is not a problem for Dict::Add since Add does not modify buffers in high end.
+                // This problem will be fixed when resolving issue: https://github.com/chxdeng/mabain/issues/21
+                rval = MBError::SUCCESS;
+                break;
+            case MABAIN_ASYNC_TYPE_REMOVE_ALL:
+                if (!rc_mode) {
                     try {
-                        rval = dict->Add((uint8_t *)node_ptr->key, node_ptr->key_len, mbd, node_ptr->overwrite);
+                        rval = dict->RemoveAll();
                     } catch (int err) {
-                        rval = err;
                         Logger::Log(LOG_LEVEL_ERROR, "dict->Add throws error %s",
-                                MBError::get_error_str(err));
+                            MBError::get_error_str(err));
+                        rval = err;
                     }
-                    break;
-                case MABAIN_ASYNC_TYPE_REMOVE:
-                    // FIXME
-                    // Removing entries during rc is currently not supported.
-                    // The index or data index could have been reset in fucntion ResourceColletion::Finish.
-                    // However, the deletion may be run for some entry which still exist in the rc root tree.
-                    // This requires modifying buffer in high end, where the offset for writing is greather than
-                    // header->m_index_offset. This causes exception thrown from DictMem::WriteData.
-                    // Note this is not a problem for Dict::Add since Add does not modify buffers in high end.
-                    // This problem will be fixed when resolving issue: https://github.com/chxdeng/mabain/issues/21
+                } else {
                     rval = MBError::SUCCESS;
-                    break;
-                case MABAIN_ASYNC_TYPE_REMOVE_ALL:
-                    if(!rc_mode)
-                    {
-                        try {
-                            rval = dict->RemoveAll();
-                        } catch (int err) {
-                            Logger::Log(LOG_LEVEL_ERROR, "dict->Add throws error %s",
-                                        MBError::get_error_str(err));
-                            rval = err;
-                        }
-                    }
-                    else
-                    {
-                        rval = MBError::SUCCESS;
-                    }
-                    break;
-                case MABAIN_ASYNC_TYPE_RC:
-                    // ignore rc task since it is running already.
-                    rval = MBError::RC_SKIPPED;
-                    break;
-                case MABAIN_ASYNC_TYPE_NONE:
-                    rval = MBError::SUCCESS;
-                    break;
-                case MABAIN_ASYNC_TYPE_BACKUP:
-                    // clean up existing backup dir varibale buffer.
-                    if (rc_backup_dir && node_ptr->data)
-                        free(rc_backup_dir);
-                    rc_backup_dir = (char *) node_ptr->data;
-                    node_ptr->data = NULL;
-                    rval = MBError::SUCCESS;
-                    break;
-                default:
-                    rval = MBError::INVALID_ARG;
-                    break;
+                }
+                break;
+            case MABAIN_ASYNC_TYPE_RC:
+                // ignore rc task since it is running already.
+                rval = MBError::RC_SKIPPED;
+                break;
+            case MABAIN_ASYNC_TYPE_NONE:
+                rval = MBError::SUCCESS;
+                break;
+            case MABAIN_ASYNC_TYPE_BACKUP:
+                // clean up existing backup dir varibale buffer.
+                if (rc_backup_dir != NULL)
+                    free(rc_backup_dir);
+                rc_backup_dir = (char*)malloc(node_ptr->data_len + 1);
+                memcpy(rc_backup_dir, node_ptr->data, node_ptr->data_len);
+                rc_backup_dir[node_ptr->data_len] = '\0';
+                rval = MBError::SUCCESS;
+                break;
+            default:
+                rval = MBError::INVALID_ARG;
+                break;
             }
 
-            free_async_node(node_ptr);
+            header->writer_index++;
+            node_ptr->num_reader.store(0, std::memory_order_release);
+            node_ptr->type = MABAIN_ASYNC_TYPE_NONE;
             node_ptr->in_use.store(false, std::memory_order_release);
-            pthread_cond_signal(&node_ptr->cond);
-            writer_index++;
             mbd.Clear();
             count++;
-        }
-        else
-        {
+        } else {
             // done processing
             count = ntasks;
         }
 
-        if(pthread_mutex_unlock(&node_ptr->mutex) != 0)
-        {
-            Logger::Log(LOG_LEVEL_ERROR, "failed to unlock mutex");
-            throw (int) MBError::MUTEX_ERROR;
-        }
-
-        if(rval != MBError::SUCCESS)
-        {
+        if (rval != MBError::SUCCESS) {
             Logger::Log(LOG_LEVEL_DEBUG, "failed to run update %d: %s",
-                        (int)node_ptr->type, MBError::get_error_str(rval));
+                (int)node_ptr->type, MBError::get_error_str(rval));
         }
     }
 
-    if(stop_processing)
+    if (stop_processing)
         return MBError::RC_SKIPPED;
     return MBError::SUCCESS;
 }
 
+uint32_t AsyncWriter::NextShmSlot(uint32_t windex, uint32_t qindex)
+{
+    int cnt = 0;
+    while (windex != qindex) {
+        if (queue[windex % header->async_queue_size].in_use.load(std::memory_order_consume))
+            break;
+        if (++cnt > header->async_queue_size) {
+            windex = qindex;
+            break;
+        }
+
+        windex++;
+    }
+
+    return windex;
+}
+
 void* AsyncWriter::async_writer_thread()
 {
-    AsyncNode *node_ptr;
+    AsyncNode* node_ptr;
     MBData mbd;
     int rval;
     int64_t min_index_size = 0;
     int64_t min_data_size = 0;
     int64_t max_dbsize = MAX_6B_OFFSET;
     int64_t max_dbcount = MAX_6B_OFFSET;
+    bool skip;
+    MBPipe mbp(db->GetDBDir(), CONSTS::ACCESS_MODE_WRITER);
 
-    Logger::Log(LOG_LEVEL_INFO, "async writer started");
-    while(true)
-    {
-        node_ptr = &queue[writer_index % max_num_queue_node];
-        if(pthread_mutex_lock(&node_ptr->mutex) != 0)
-        {
-            Logger::Log(LOG_LEVEL_ERROR, "failed to lock mutex");
-            throw (int) MBError::MUTEX_ERROR;
-        }
+    Logger::Log(LOG_LEVEL_DEBUG, "async writer started");
+    if (!(db->GetDBOptions() & CONSTS::OPTION_JEMALLOC)) {
+        ResourceCollection rc(*db);
+        writer_lock.lock();
+        rc.ExceptionRecovery();
+        writer_lock.unlock();
+    }
 
-        while(!node_ptr->in_use.load(std::memory_order_consume))
-        {
-            if(stop_processing)
+    while (!stop_processing) {
+        node_ptr = &queue[header->writer_index % header->async_queue_size];
+
+        skip = false;
+        while (!node_ptr->in_use.load(std::memory_order_consume)) {
+            if (stop_processing) {
+                skip = true;
                 break;
-            pthread_cond_wait(&node_ptr->cond, &node_ptr->mutex);
+            }
+
+#define __ASYNC_THREAD_SLEEP_TIME 1000
+            mbp.Wait(__ASYNC_THREAD_SLEEP_TIME);
+
+            auto windex = header->writer_index;
+            auto qindex = header->queue_index.load(std::memory_order_consume);
+            if (windex != qindex) {
+                // Reader process may have exited unexpectedly. Recover index.
+                skip = true;
+                header->writer_index = NextShmSlot(windex, qindex);
+                break;
+            }
         }
 
-        if(stop_processing && !node_ptr->in_use.load(std::memory_order_consume))
-        {
-            pthread_mutex_unlock(&node_ptr->mutex);
+        if (skip)
+            continue;
+
+        // process the node
+        switch (node_ptr->type) {
+        case MABAIN_ASYNC_TYPE_ADD:
+            mbd.buff = (uint8_t*)node_ptr->data;
+            mbd.data_len = node_ptr->data_len;
+            writer_lock.lock();
+            try {
+                rval = dict->Add((uint8_t*)node_ptr->key, node_ptr->key_len, mbd,
+                    node_ptr->overwrite);
+            } catch (int err) {
+                Logger::Log(LOG_LEVEL_ERROR, "dict->Add throws error %s",
+                    MBError::get_error_str(err));
+                rval = err;
+            }
+            writer_lock.unlock();
+            break;
+        case MABAIN_ASYNC_TYPE_REMOVE:
+            mbd.options |= CONSTS::OPTION_FIND_AND_STORE_PARENT;
+            writer_lock.lock();
+            try {
+                rval = dict->Remove((uint8_t*)node_ptr->key, node_ptr->key_len, mbd);
+            } catch (int err) {
+                Logger::Log(LOG_LEVEL_ERROR, "dict->Remmove throws error %s",
+                    MBError::get_error_str(err));
+                rval = err;
+            }
+            writer_lock.unlock();
+            mbd.options &= ~CONSTS::OPTION_FIND_AND_STORE_PARENT;
+            break;
+        case MABAIN_ASYNC_TYPE_REMOVE_ALL:
+            writer_lock.lock();
+            try {
+                rval = dict->RemoveAll();
+            } catch (int err) {
+                Logger::Log(LOG_LEVEL_ERROR, "dict->RemoveAll throws error %s",
+                    MBError::get_error_str(err));
+                rval = err;
+            }
+            writer_lock.unlock();
+            break;
+        case MABAIN_ASYNC_TYPE_RC:
+            rval = MBError::SUCCESS;
+            header->rc_flag.store(1, std::memory_order_release);
+            {
+                int64_t* data_ptr = reinterpret_cast<int64_t*>(node_ptr->data);
+                min_index_size = data_ptr[0];
+                min_data_size = data_ptr[1];
+                max_dbsize = data_ptr[2];
+                max_dbcount = data_ptr[3];
+            }
+            break;
+        case MABAIN_ASYNC_TYPE_NONE:
+            rval = MBError::SUCCESS;
+            break;
+        case MABAIN_ASYNC_TYPE_BACKUP:
+            try {
+                DBBackup mbbk(*db);
+                rval = mbbk.Backup((const char*)node_ptr->data);
+            } catch (int error) {
+                rval = error;
+            }
+            break;
+        default:
+            rval = MBError::INVALID_ARG;
             break;
         }
 
-        // process the node
-        switch(node_ptr->type)
-        {
-            case MABAIN_ASYNC_TYPE_ADD:
-                mbd.buff = (uint8_t *) node_ptr->data;
-                mbd.data_len = node_ptr->data_len;
-                try {
-                    rval = dict->Add((uint8_t *)node_ptr->key, node_ptr->key_len, mbd,
-                                     node_ptr->overwrite);
-                } catch (int err) {
-                    Logger::Log(LOG_LEVEL_ERROR, "dict->Add throws error %s",
-                                MBError::get_error_str(err));
-                    rval = err;
-                }
-                break;
-            case MABAIN_ASYNC_TYPE_REMOVE:
-                mbd.options |= CONSTS::OPTION_FIND_AND_STORE_PARENT;
-                try {
-                    rval = dict->Remove((uint8_t *)node_ptr->key, node_ptr->key_len, mbd);
-                } catch (int err) {
-                    Logger::Log(LOG_LEVEL_ERROR, "dict->Remmove throws error %s",
-                                MBError::get_error_str(err));
-                    rval = err;
-                }
-                mbd.options &= ~CONSTS::OPTION_FIND_AND_STORE_PARENT;
-                break;
-            case MABAIN_ASYNC_TYPE_REMOVE_ALL:
-                try {
-                    rval = dict->RemoveAll();
-                } catch (int err) {
-                    Logger::Log(LOG_LEVEL_ERROR, "dict->RemoveAll throws error %s",
-                                MBError::get_error_str(err));
-                    rval = err;
-                }
-                break;
-            case MABAIN_ASYNC_TYPE_RC:
-                rval = MBError::SUCCESS;
-                is_rc_running = true;
-                {
-                    int64_t *data_ptr = (int64_t *) node_ptr->data;
-                    min_index_size = data_ptr[0];
-                    min_data_size  = data_ptr[1];
-                    max_dbsize = data_ptr[2];
-                    max_dbcount = data_ptr[3];
-                }
-                break;
-            case MABAIN_ASYNC_TYPE_NONE:
-                rval = MBError::SUCCESS;
-                break;
-            case MABAIN_ASYNC_TYPE_BACKUP:
-                try {
-                    DBBackup mbbk(*db);
-                    rval = mbbk.Backup((const char*) node_ptr->data);
-                } catch (int error) {
-                    rval = error;
-                }
-                    break;
-            default:
-                rval = MBError::INVALID_ARG;
-                break;
-        }
-
-        free_async_node(node_ptr);
+        header->writer_index++;
+        node_ptr->num_reader.store(0, std::memory_order_release);
+        node_ptr->type = MABAIN_ASYNC_TYPE_NONE;
         node_ptr->in_use.store(false, std::memory_order_release);
-        pthread_cond_signal(&node_ptr->cond);
-        if(pthread_mutex_unlock(&node_ptr->mutex) != 0)
-        {
-            Logger::Log(LOG_LEVEL_ERROR, "failed to unlock mutex");
-            throw (int) MBError::MUTEX_ERROR;
-        }
 
-        if(rval != MBError::SUCCESS)
-        {
+        if (rval != MBError::SUCCESS) {
             Logger::Log(LOG_LEVEL_DEBUG, "failed to run update %d: %s",
-                        (int)node_ptr->type, MBError::get_error_str(rval));
+                (int)node_ptr->type, MBError::get_error_str(rval));
         }
 
-        writer_index++;
         mbd.Clear();
 
-        if(is_rc_running)
-        {
+        if (header->rc_flag.load(std::memory_order_consume) == 1) {
             rval = MBError::SUCCESS;
+            writer_lock.lock();
             try {
                 ResourceCollection rc = ResourceCollection(*db);
                 rc.ReclaimResource(min_index_size, min_data_size, max_dbsize, max_dbcount, this);
             } catch (int error) {
-                if(error != MBError::RC_SKIPPED)
+                if (error != MBError::RC_SKIPPED) {
                     Logger::Log(LOG_LEVEL_WARN, "rc failed :%s", MBError::get_error_str(error));
-                else
                     rval = error;
+                }
             }
+            writer_lock.unlock();
 
-            is_rc_running = false;
-            if(rc_backup_dir != NULL)
-            {
-                if(rval == MBError::SUCCESS)
-                    Backup(rc_backup_dir);
+            header->rc_flag.store(0, std::memory_order_release);
+            if (rc_backup_dir != NULL) {
+                if (rval == MBError::SUCCESS) {
+                    dict->SHMQ_Backup(rc_backup_dir);
+                }
                 free(rc_backup_dir);
                 rc_backup_dir = NULL;
             }
@@ -541,14 +354,34 @@ void* AsyncWriter::async_writer_thread()
     }
 
     mbd.buff = NULL;
-    Logger::Log(LOG_LEVEL_INFO, "async writer exiting");
+    Logger::Log(LOG_LEVEL_DEBUG, "async writer exiting");
     return NULL;
 }
 
-void* AsyncWriter::async_thread_wrapper(void *context)
+void* AsyncWriter::async_thread_wrapper(void* context)
 {
-    AsyncWriter *instance_ptr = static_cast<AsyncWriter *>(context);
+    AsyncWriter* instance_ptr = reinterpret_cast<AsyncWriter*>(context);
     return instance_ptr->async_writer_thread();
+}
+
+int AsyncWriter::AddWithLock(const char* key, int len, MBData& mbdata, bool overwrite)
+{
+    if (header->rc_flag.load(std::memory_order_relaxed))
+        return MBError::TRY_AGAIN;
+
+    using Ms = std::chrono::milliseconds;
+    if (writer_lock.try_lock_for(Ms(1000))) {
+        int rval;
+        try {
+            rval = dict->Add(reinterpret_cast<const uint8_t*>(key), len, mbdata, overwrite);
+        } catch (int error) {
+            rval = error;
+        }
+        writer_lock.unlock();
+        return rval;
+    }
+
+    return MBError::TRY_AGAIN;
 }
 
 }

@@ -24,11 +24,9 @@
 namespace mabain {
 
 // mabain errors
-class MBError
-{
+class MBError {
 public:
-    enum mb_error
-    {
+    enum mb_error {
         SUCCESS = 0,
         NO_MEMORY = 1,
         OUT_OF_BOUND = 2,
@@ -52,6 +50,8 @@ public:
         BUFFER_LOST = 20,
         THREAD_FAILED = 21,
         RC_SKIPPED = 22,
+        VERSION_MISMATCH = 23,
+        JEMALLOC_ERROR = 24,
 
         // NO_DB should be the last enum.
         NO_DB

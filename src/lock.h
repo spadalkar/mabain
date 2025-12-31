@@ -23,59 +23,21 @@
 
 namespace mabain {
 
-// multiple-thread/process reader/writer lock
+// multiple-thread/process lock
 
-class MBLock
-{
+class MBLock {
 public:
     MBLock();
     ~MBLock();
 
-    // Writer lock
-    inline int WrLock();
-    // Reader lock
-    inline int RdLock();
-    // Writer/reader unlock
-    inline int UnLock();
+    int Lock();
+    int UnLock();
 
-    inline int TryWrLock();
-
-    void Init(pthread_rwlock_t *rw_lock);
+    void Init(pthread_mutex_t* lock);
 
 private:
-    // a global lock variable
-    static pthread_rwlock_t mb_rw_lock;
-
-    pthread_rwlock_t *mb_rw_lock_ptr;
+    pthread_mutex_t* mb_lock_ptr;
 };
-
-inline int MBLock::WrLock()
-{
-    if(mb_rw_lock_ptr == NULL)
-        return -1;
-    return pthread_rwlock_wrlock(mb_rw_lock_ptr);
-}
-
-inline int MBLock::RdLock()
-{
-    if(mb_rw_lock_ptr == NULL)
-        return -1;
-    return pthread_rwlock_rdlock(mb_rw_lock_ptr);
-}
-
-inline int MBLock::UnLock()
-{
-    if(mb_rw_lock_ptr == NULL)
-        return -1;
-    return pthread_rwlock_unlock(mb_rw_lock_ptr);
-}
-
-inline int MBLock::TryWrLock()
-{
-    if(mb_rw_lock_ptr == NULL)
-        return -1;
-    return pthread_rwlock_trywrlock(mb_rw_lock_ptr);
-}
 
 }
 

@@ -1,0 +1,31 @@
+#!/bin/bash
+
+set -e
+
+# Use build dir relative to this script instead of a hardcoded path
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="${SCRIPT_DIR}/build/lib${LD_LIBRARY_PATH+:$LD_LIBRARY_PATH}"
+
+cd build
+# Configure with xxHash enabled (falls back to FNV-1a if lib not found)
+cmake .. -DMB_USE_XXHASH=ON -DENABLE_DEBUG=OFF >/dev/null
+make -j"${JOBS:-2}" || exit 1
+cd ..
+
+cd db_comparisons
+make || exit 1
+
+./db_comp_mb -pcc 500000 -k u32 -j
+
+./db_comp_mb -pcc 500000 -k int -j
+
+./db_comp_mb -pcc 500000 -k sha1 -j
+
+./db_comp_mb -pcc 500000 -k sha2 -j
+
+cd ../src/test
+make || exit 1
+
+./mb_bound_test -pcn 4 -pcc 131072 -pc-shared -pc-assoc 8
+
+cd ../../

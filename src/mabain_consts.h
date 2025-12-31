@@ -1,5 +1,5 @@
 /**
- * Copyright (C) 2017 Cisco Inc.
+ * Copyright (C) 2025 Cisco Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU General Public License, version 2,
@@ -21,8 +21,7 @@
 
 namespace mabain {
 
-class CONSTS
-{
+class CONSTS {
 public:
     static const int ACCESS_MODE_READER;
     static const int ACCESS_MODE_WRITER;
@@ -30,13 +29,23 @@ public:
     static const int SYNC_ON_WRITE;
     static const int USE_SLIDING_WINDOW;
     static const int MEMORY_ONLY_MODE;
-    static const int OPTION_ALL_PREFIX;
+    static const int READ_ONLY_DB;
+
     static const int OPTION_FIND_AND_STORE_PARENT;
     static const int OPTION_RC_MODE;
     static const int OPTION_READ_SAVED_EDGE; // Used internally only
-    // not init shared memory ptr, not update db counter
+    static const int OPTION_INTERNAL_NODE_BOUND;
+    static const int OPTION_KEY_ONLY; // Skip value read in bound lookups
     static const int MAX_KEY_LENGHTH;
     static const int MAX_DATA_SIZE;
+    static const int OPTION_SHMQ_RETRY;
+    static const int OPTION_JEMALLOC;
+    static const int OPTION_PREFIX_CACHE; // Enable embedded prefix cache at DB creation
+
+    // Max retries for lock-free reader retry loops before returning TRY_AGAIN
+    static const int LOCK_FREE_RETRY_LIMIT;
+    // Max steps allowed in Find traversal loop to avoid pathological spins
+    static const int FIND_TRAVERSAL_LIMIT;
 
     static int WriterOptions();
     static int ReaderOptions();

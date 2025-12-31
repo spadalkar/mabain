@@ -19,10 +19,10 @@
 #ifndef __RESOURCE_POOL__
 #define __RESOURCE_POOL__
 
-#include <map>
 #include <memory>
-#include <string>
 #include <pthread.h>
+#include <string>
+#include <unordered_map>
 
 #include "mmap_file.h"
 
@@ -32,21 +32,22 @@ namespace mabain {
 // shared_ptr. All db handles for the same db will share the same
 // file descriptors so that we won't be running out of file descriptors
 // when there are a large number of DB handles opened.
-class ResourcePool
-{
+class ResourcePool {
 public:
     ~ResourcePool();
 
-    std::shared_ptr<MmapFileIO> OpenFile(const std::string &fpath, int mode,
-                                         size_t file_size, bool &map_file,
-                                         bool create_file);
-    void RemoveResourceByDB(const std::string &db_path);
-    void RemoveResourceByPath(const std::string &path);
+    std::shared_ptr<MmapFileIO> OpenFile(const std::string& fpath, int mode,
+        size_t file_size, bool& map_file,
+        bool create_file);
+    void RemoveResourceByDB(const std::string& db_path);
+    void RemoveResourceByPath(const std::string& path);
     void RemoveAll();
-    bool CheckExistence(const std::string &header_path);
-    int  AddResourceByPath(const std::string &path, std::shared_ptr<MmapFileIO> resource);
+    bool CheckExistence(const std::string& header_path);
+    int AddResourceByPath(const std::string& path, std::shared_ptr<MmapFileIO> resource);
+    MmapFileIO* GetResourceByPath(const std::string& path);
 
-    static ResourcePool& getInstance() {
+    static ResourcePool& getInstance()
+    {
         static ResourcePool instance; // only one instance per process
         return instance;
     }
@@ -54,7 +55,7 @@ public:
 private:
     ResourcePool();
 
-    std::map<std::string, std::shared_ptr<MmapFileIO>> file_pool;
+    std::unordered_map<std::string, std::shared_ptr<MmapFileIO>> file_pool;
     pthread_mutex_t pool_mutex;
 };
 

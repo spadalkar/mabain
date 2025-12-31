@@ -1,0 +1,81 @@
+# Define the library
+file(GLOB SOURCES "*.cpp" "util/*.cpp" "detail/*.cpp")
+# Explicitly exclude experimental lb_range_cache_shared from build
+list(REMOVE_ITEM SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/util/lb_range_cache_shared.cpp)
+file(GLOB HEADERS "*.h" "util/*.h" "detail/*.h")
+
+find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h PATHS /usr/include /usr/local/include)
+find_library(JEMALLOC_LIBRARY jemalloc PATHS /usr/lib /usr/local/lib)
+
+if(NOT JEMALLOC_INCLUDE_DIR OR NOT JEMALLOC_LIBRARY)
+    message(FATAL_ERROR "jemalloc not found")
+endif()
+
+add_library(mabain SHARED ${SOURCES})
+
+# Specify include directories for this target
+target_include_directories(mabain PUBLIC ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/util ${JEMALLOC_INCLUDE_DIR})
+
+# Optional: use xxHash for prefix hashing in shared prefix cache
+option(MB_USE_XXHASH "Use xxHash for prefix hashing" OFF)
+if(MB_USE_XXHASH)
+    find_path(XXHASH_INCLUDE_DIR NAMES xxhash.h PATHS /usr/include /usr/local/include)
+    find_library(XXHASH_LIBRARY NAMES xxhash PATHS /usr/lib /usr/local/lib)
+    if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
+        target_include_directories(mabain PUBLIC ${XXHASH_INCLUDE_DIR})
+        target_link_libraries(mabain ${XXHASH_LIBRARY})
+        target_compile_definitions(mabain PRIVATE MB_HAVE_XXHASH)
+        message(STATUS "Using xxHash for prefix hashing")
+    else()
+        message(WARNING "MB_USE_XXHASH=ON but xxhash library not found; falling back to FNV1a")
+    endif()
+endif()
+
+# Always enable traversal step guard in find loops
+target_compile_definitions(mabain PRIVATE MB_ENABLE_TRAVERSAL_LIMIT)
+
+# Set compile options
+option(MB_WERROR "Treat warnings as errors" OFF)
+set(MB_WARN_OPTS -Wall -Wwrite-strings -Wsign-compare -Wcast-align -Wformat-security -fdiagnostics-show-option)
+if(MB_WERROR)
+    list(APPEND MB_WARN_OPTS -Werror)
+endif()
+# Base optimization flags that work across all supported CPUs
+set(MB_OPT_FLAGS -g -ggdb -fPIC -O2 -std=c++17 -D__LOCK_FREE__)
+
+# Allow callers to opt-in to native instruction set optimizations when they
+# know the build host and target host share the same CPU features. Leaving
+# this off by default keeps released binaries portable and avoids SIGILL
+# crashes on older hardware.
+option(MB_ENABLE_NATIVE_OPTIMIZATIONS "Enable -march=native for local builds" OFF)
+if(MB_ENABLE_NATIVE_OPTIMIZATIONS)
+    list(APPEND MB_OPT_FLAGS -march=native)
+endif()
+
+target_compile_options(mabain PRIVATE ${MB_WARN_OPTS} ${MB_OPT_FLAGS})
+
+# Link-time optimization (optional)
+option(ENABLE_IPO "Enable interprocedural optimization" OFF)
+if(ENABLE_IPO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT lto_supported OUTPUT lto_output)
+  if(lto_supported)
+    set_property(TARGET mabain PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  endif()
+endif()
+
+# Conditionally add __DEBUG__ definition
+if(ENABLE_DEBUG)
+    target_compile_definitions(mabain PRIVATE __DEBUG__)
+endif()
+
+# Link libraries
+target_link_libraries(mabain pthread ${JEMALLOC_LIBRARY})
+
+# Specify the library output directory
+set_target_properties(mabain PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+)
+cmake_minimum_required(VERSION 3.13)
+project(mabain CXX)
+cmake_policy(SET CMP0069 NEW)

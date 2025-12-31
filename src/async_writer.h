@@ -19,78 +19,53 @@
 #ifndef __ASYNC_WRITER_H__
 #define __ASYNC_WRITER_H__
 
+#include <mutex>
 #include <pthread.h>
 
 #include "db.h"
-//#include "mb_rc.h"
 #include "dict.h"
+#include "drm_base.h"
+#include "error.h"
 #include "mb_backup.h"
+#include "shm_queue_mgr.h"
 
 namespace mabain {
 
-#define MABAIN_ASYNC_TYPE_NONE       0
-#define MABAIN_ASYNC_TYPE_ADD        1
-#define MABAIN_ASYNC_TYPE_REMOVE     2
-#define MABAIN_ASYNC_TYPE_REMOVE_ALL 3
-#define MABAIN_ASYNC_TYPE_RC         4
-#define MABAIN_ASYNC_TYPE_BACKUP     5
-    
-typedef struct _AsyncNode
-{
-    std::atomic<bool> in_use;
-    pthread_mutex_t   mutex;
-    pthread_cond_t    cond;
-
-    char *key;
-    void *data;
-    int key_len;
-    int data_len;
-    bool overwrite;
-    char type;
-} AsyncNode;
-
-class AsyncWriter
-{
+class AsyncWriter {
 public:
-
-    AsyncWriter(DB *db_ptr);
     ~AsyncWriter();
 
-    void UpdateNumUsers(int delta);
-    int  Add(const char *key, int key_len, const char *data, int data_len, bool overwrite);
-    int  Remove(const char *key, int len);
-    int  RemoveAll();
-    int  Backup(const char *backup_dir);
-    int  CollectResource(int64_t m_index_rc_size, int64_t m_data_rc_size, 
-                         int64_t max_dbsz, int64_t max_dbcnt);
-    int  StopAsyncThread();
-    bool Busy() const;
-    int  ProcessTask(int ntasks, bool rc_mode);
+    int StopAsyncThread();
+    int ProcessTask(int ntasks, bool rc_mode);
+    int AddWithLock(const char* key, int len, MBData& mbdata, bool overwrite);
+
+    static AsyncWriter* CreateInstance(DB* db_ptr);
+    static AsyncWriter* GetInstance();
 
 private:
-    static void *async_thread_wrapper(void *context);
+    AsyncWriter(DB* db_ptr);
+    static void* async_thread_wrapper(void* context);
     AsyncNode* AcquireSlot();
-    int PrepareSlot(AsyncNode *node_ptr) const;
+    int PrepareSlot(AsyncNode* node_ptr) const;
     void* async_writer_thread();
-
-    static const int max_num_queue_node;
+    uint32_t NextShmSlot(uint32_t windex, uint32_t qindex);
 
     // db pointer
-    DB *db;
-    Dict *dict;
-
-    std::atomic<int> num_users;
-    AsyncNode *queue;
+    DB* db;
+    Dict* dict;
 
     // thread id
     pthread_t tid;
-
     bool stop_processing;
-    std::atomic<uint32_t> queue_index;
-    uint32_t writer_index;
+
+    AsyncNode* queue;
+    IndexHeader* header;
 
     bool is_rc_running;
-    char *rc_backup_dir;
+    char* rc_backup_dir;
+
+    std::timed_mutex writer_lock;
+    static AsyncWriter* writer_instance;
 };
 
 }
